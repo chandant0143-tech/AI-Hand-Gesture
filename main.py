@@ -1,152 +1,80 @@
-import cv2
-import pyautogui
-from hand_tracking import HandDetector
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-import math
+"""Primary application entrypoint."""
 
-# Disable PyAutoGUI fail-safe
-pyautogui.FAILSAFE = False
+from __future__ import annotations
 
-# Get screen dimensions
-screen_width, screen_height = pyautogui.size()
+import locale
+import logging
+import os
+import sys
+import warnings
 
-# Initialize volume control
-try:
-    devices = AudioUtilities.GetSpeakers()
-    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-    volume = cast(interface, POINTER(IAudioEndpointVolume))
-    volume_range = volume.GetVolumeRange()
-    min_vol, max_vol = volume_range[0], volume_range[1]
-    volume_enabled = True
-except Exception as e:
-    print(f"Volume control not available: {e}")
-    volume_enabled = False
-    min_vol, max_vol = 0, 100
+from pip._internal.cli.autocompletion import autocomplete
+from pip._internal.cli.main_parser import parse_command
+from pip._internal.commands import create_command
+from pip._internal.exceptions import PipError
+from pip._internal.utils import deprecation
 
-# Initialize webcam
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Cannot access webcam")
-    exit()
+logger = logging.getLogger(__name__)
 
-cap.set(3, 640)
-cap.set(4, 480)
 
-print(f"Webcam opened: {cap.get(3)}x{cap.get(4)}")
+# Do not import and use main() directly! Using it directly is actively
+# discouraged by pip's maintainers. The name, location and behavior of
+# this function is subject to change, so calling it directly is not
+# portable across different pip versions.
 
-# Initialize hand detector
-try:
-    detector = HandDetector(max_hands=1)
-    print("Hand detector initialized successfully")
-except Exception as e:
-    print(f"Error initializing detector: {e}")
-    exit()
+# In addition, running pip in-process is unsupported and unsafe. This is
+# elaborated in detail at
+# https://pip.pypa.io/en/stable/user_guide/#using-pip-from-your-program.
+# That document also provides suggestions that should work for nearly
+# all users that are considering importing and using main() directly.
 
-# Variables
-smoothing = 5
-prev_x, prev_y = 0, 0
-click_threshold = 40
-action_cooldown = 0
-paused = False
+# However, we know that certain users will still want to invoke pip
+# in-process. If you understand and accept the implications of using pip
+# in an unsupported manner, the best approach is to use runpy to avoid
+# depending on the exact location of this entry point.
 
-print("\n=== AI Hand Gesture Control System ===")
-print("\nGestures:")
-print("1 finger (index) = Move cursor")
-print("2 fingers (index+middle) = Scroll mode")
-print("Pinch (thumb+index close) = Left click")
-print("Pinch (thumb+middle close) = Right click")
-print("Pinch (thumb+index) in volume mode = Volume control")
-print("5 fingers (open palm) = Pause/Resume")
-print("\nPress ESC or 'q' to exit\n")
+# The following example shows how to use runpy to invoke pip in that
+# case:
+#
+#     sys.argv = ["pip", your, args, here]
+#     runpy.run_module("pip", run_name="__main__")
+#
+# Note that this will exit the process after running, unlike a direct
+# call to main. As it is not safe to do any processing after calling
+# main, this should not be an issue in practice.
 
-while True:
-    success, frame = cap.read()
-    if not success:
-        break
-    
-    frame = cv2.flip(frame, 1)
-    
+
+def main(args: list[str] | None = None) -> int:
+    if args is None:
+        args = sys.argv[1:]
+
+    # Suppress the pkg_resources deprecation warning
+    # Note - we use a module of .*pkg_resources to cover
+    # the normal case (pip._vendor.pkg_resources) and the
+    # devendored case (a bare pkg_resources)
+    warnings.filterwarnings(
+        action="ignore", category=DeprecationWarning, module=".*pkg_resources"
+    )
+
+    # Configure our deprecation warnings to be sent through loggers
+    deprecation.install_warning_logger()
+
+    autocomplete()
+
     try:
-        frame = detector.find_hands(frame)
-        x, y = detector.get_finger_position(frame)
-        fingers = detector.count_fingers(frame)
-        
-        if action_cooldown > 0:
-            action_cooldown -= 1
-        
-        # Pause/Resume gesture (5 fingers)
-        if fingers == 5 and action_cooldown == 0:
-            paused = not paused
-            action_cooldown = 20
-            status = "PAUSED" if paused else "RESUMED"
-            cv2.putText(frame, status, (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
-        
-        if paused:
-            cv2.putText(frame, "SYSTEM PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        elif x and y:
-            # Mouse movement (1 finger)
-            if fingers == 1:
-                screen_x = int((x / 640) * screen_width)
-                screen_y = int((y / 480) * screen_height)
-                current_x = prev_x + (screen_x - prev_x) / smoothing
-                current_y = prev_y + (screen_y - prev_y) / smoothing
-                pyautogui.moveTo(current_x, current_y)
-                prev_x, prev_y = current_x, current_y
-                cv2.putText(frame, "MOVE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            # Scroll mode (2 fingers)
-            elif fingers == 2:
-                if y < 240:
-                    pyautogui.scroll(10)
-                    cv2.putText(frame, "SCROLL UP", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-                else:
-                    pyautogui.scroll(-10)
-                    cv2.putText(frame, "SCROLL DOWN", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-            
-            # Volume control (3 fingers)
-            elif fingers == 3:
-                distance, p1, p2 = detector.get_distance(frame, 8, 4)
-                if distance and volume_enabled:
-                    vol = int((distance - 20) / 200 * (max_vol - min_vol) + min_vol)
-                    vol = max(min_vol, min(max_vol, vol))
-                    volume.SetMasterVolumeLevel(vol, None)
-                    vol_percent = int((vol - min_vol) / (max_vol - min_vol) * 100)
-                    cv2.putText(frame, f"VOLUME: {vol_percent}%", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-                    cv2.line(frame, p1, p2, (255, 255, 0), 3)
-                elif not volume_enabled:
-                    cv2.putText(frame, "VOLUME: Not Available", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-            
-            # Left click (pinch thumb+index)
-            distance_thumb_index, p1, p2 = detector.get_distance(frame, 8, 4)
-            if distance_thumb_index and distance_thumb_index < click_threshold and action_cooldown == 0 and fingers <= 2:
-                pyautogui.click()
-                action_cooldown = 15
-                cv2.putText(frame, "LEFT CLICK", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-            
-            # Right click (pinch thumb+middle)
-            distance_thumb_middle, p3, p4 = detector.get_distance(frame, 12, 4)
-            if distance_thumb_middle and distance_thumb_middle < click_threshold and action_cooldown == 0:
-                pyautogui.rightClick()
-                action_cooldown = 15
-                cv2.putText(frame, "RIGHT CLICK", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 3)
-            
-            cv2.circle(frame, (x, y), 10, (0, 255, 0), cv2.FILLED)
-            cv2.putText(frame, f"Fingers: {fingers}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        else:
-            cv2.putText(frame, "No Hand Detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    
-    except Exception as e:
-        print(f"Error: {e}")
-        cv2.putText(frame, "Error", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    
-    cv2.imshow("AI Gesture Mouse", frame)
-    
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27 or key == ord('q'):
-        break
+        cmd_name, cmd_args = parse_command(args)
+    except PipError as exc:
+        sys.stderr.write(f"ERROR: {exc}")
+        sys.stderr.write(os.linesep)
+        sys.exit(1)
 
-cap.release()
-cv2.destroyAllWindows()
-print("Program terminated")
+    # Needed for locale.getpreferredencoding(False) to work
+    # in pip._internal.utils.encoding.auto_decode
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error as e:
+        # setlocale can apparently crash if locale are uninitialized
+        logger.debug("Ignoring error %s when setting locale", e)
+    command = create_command(cmd_name, isolated=("--isolated" in cmd_args))
+
+    return command.main(cmd_args)
